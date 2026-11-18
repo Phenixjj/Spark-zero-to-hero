@@ -1,0 +1,46 @@
+services:
+  jupyter:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+      args:
+        SPARK_UID: ${LOCAL_UID:-1000}
+        SPARK_GID: ${LOCAL_GID:-1000}
+    image: spark-zero-to-hero:local
+    hostname: jupyter
+    environment:
+      SPARK_LOCAL_HOSTNAME: jupyter
+    command: jupyter lab --ip=0.0.0.0 --no-browser --ServerApp.root_dir=/workspace
+    ports:
+      - "127.0.0.1:8888:8888"
+      - "127.0.0.1:${SPARK_UI_PORT:-4040}:4040"
+    volumes:
+      - ..:/workspace
+    depends_on:
+      - spark-master
+      - spark-worker
+
+  spark-master:
+    image: spark-zero-to-hero:local
+    hostname: spark-master
+    environment:
+      SPARK_LOCAL_HOSTNAME: spark-master
+    command: /usr/local/lib/python3.11/site-packages/pyspark/bin/spark-class org.apache.spark.deploy.master.Master --host spark-master
+    ports:
+      - "127.0.0.1:8080:8080"
+    volumes:
+      - ..:/workspace
+
+  spark-worker:
+    image: spark-zero-to-hero:local
+    hostname: spark-worker
+    environment:
+      SPARK_LOCAL_HOSTNAME: spark-worker
+      SPARK_WORKER_DIR: /tmp/spark-work
+    command: /usr/local/lib/python3.11/site-packages/pyspark/bin/spark-class org.apache.spark.deploy.worker.Worker spark://spark-master:7077
+    ports:
+      - "127.0.0.1:8081:8081"
+    volumes:
+      - ..:/workspace
+    depends_on:
+      - spark-master
