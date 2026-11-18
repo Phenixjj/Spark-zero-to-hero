@@ -53,6 +53,25 @@ accentuer le déséquilibre. `spark.sql.shuffle.partitions=2` convient à la
 démo locale, pas nécessairement à la production. AQE peut adapter le nombre
 de partitions et certains choix de jointure.
 
+### Deux plans physiques de jointure
+
+* **SortMergeJoin** : pour une équijointure compatible, Spark redistribue
+  généralement chaque côté par clé (`Exchange`), trie chaque partition
+  (`Sort`), puis parcourt les groupes de clés triés pour les apparier.
+  Une distribution ou un tri déjà adapté peut éviter une étape. Ce plan
+  convient aux grandes entrées, mais le shuffle et les tris coûtent réseau,
+  CPU et parfois disque en cas de spill.
+* **BroadcastHashJoin** : Spark construit et diffuse une relation de hachage
+  à partir du petit côté (`BroadcastExchange`), puis chaque tâche sonde
+  cette table avec les lignes de l'autre côté. Il évite le shuffle de ce
+  dernier pour la jointure, mais la construction et la diffusion ont un coût
+  et occupent de la mémoire sur le driver et les exécuteurs. Les clés et le
+  type de jointure déterminent les stratégies et côtés de construction valides.
+
+Vérifier le plan physique final et les métriques plutôt que supposer qu'un
+algorithme est toujours supérieur : AQE et les statistiques peuvent modifier
+le choix. Une opération ultérieure peut encore nécessiter son propre shuffle.
+
 ### Broadcast et réduction du volume
 
 `broadcast(categories)` demande à Spark de distribuer la petite dimension
@@ -70,6 +89,38 @@ potentiellement le nombre de lignes jointes, mais entraîne un shuffle et
 peut être moins avantageux si les clés sont presque toutes distinctes.
 Comparer les plans et les métriques sur des données représentatives avant
 d'adopter cette stratégie.
+
+### Diagnostiquer le skew et les erreurs mémoire
+
+Dans Spark UI, comparer les distributions de durée, de taille de shuffle et
+de spill par tâche ainsi que le temps GC ; une poignée de tâches très
+volumineuses ou lentes peut révéler une clé chaude. Inspecter aussi la
+fréquence des clés. AQE, activé par défaut en Spark 3.5, peut détecter et
+découper des partitions déséquilibrées de certaines jointures après shuffle,
+selon ses seuils, en répliquant si nécessaire des données de l'autre côté.
+Il n'élimine pas tout skew, notamment celui d'une agrégation.
+
+Si une clé reste problématique, le **salting** peut répartir ses lignes sur
+plusieurs sous-clés. Pour une jointure, répartir les lignes de la clé chaude
+d'un côté et répliquer les lignes correspondantes de l'autre sur les sels,
+puis joindre sur clé et sel ; préserver la multiplicité et la sémantique du
+type de jointure, notamment pour les jointures externes. Pour une agrégation
+décomposable, agréger par clé et sel puis combiner les résultats par clé.
+Cette technique ajoute des données et des étapes ; elle n'est pas générale
+pour tous les agrégats. Mesurer son effet et tester l'équivalence des résultats.
+Augmenter simplement le nombre de partitions ne répartit pas une seule clé
+chaude entre plusieurs partitions de hachage.
+
+En cas d'**OOM**, distinguer driver, exécuteur JVM et processus Python dans les
+logs et les métriques ; surveiller notamment GC, spill, taille des partitions
+et cache. Réduire les colonnes et lignes tôt, ajuster le partitionnement pour
+limiter la taille par tâche, retirer un broadcast trop volumineux et
+`unpersist()` les données inutilisées. Le spill réduit la pression mémoire au
+prix d'E/S, mais ne garantit pas l'absence d'OOM. Adapter mémoire et
+`memoryOverhead` aux ressources disponibles et à la cause observée ; davantage
+de mémoire seule ne corrige pas nécessairement le skew. Éviter `collect()` sur
+un gros résultat : il rassemble les lignes dans la mémoire du driver ; préférer
+une écriture distribuée ou une inspection explicitement bornée.
 
 ### Cache et cycle de vie
 

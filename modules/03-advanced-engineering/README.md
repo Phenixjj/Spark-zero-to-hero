@@ -7,14 +7,22 @@ Ils ne nécessitent ni cluster ni service externe.
 
 ## Installation et exécution
 
-Dans un environnement virtuel Python 3.11, installer `pyspark==3.5.3` et
-`pytest` (les versions 3.5.x de Spark conviennent également). Depuis ce dossier :
+Dans un environnement virtuel Python 3.11, installer les dépendances épinglées
+du projet, notamment PySpark, pytest, pandas et PyArrow, puis activer cet
+environnement. Depuis ce dossier :
 
 ```bash
+python -m pip install -r ../../requirements.txt
 python scripts/plans_and_windows.py
 python scripts/quality_and_storage.py
+python scripts/udf_and_arrow.py
 python -m pytest -q tests
 ```
+
+Le driver et les workers doivent utiliser des environnements Python compatibles
+contenant pandas et PyArrow. En local, activer le venv ou définir
+`PYSPARK_PYTHON` vers son interpréteur ; en cluster, distribuer ces dépendances
+aux workers.
 
 Le second exemple crée un répertoire local `.spark-advanced-example`, refuse
 de l'écraser s'il existe, puis le supprime à la fin. Les scripts contiennent des
@@ -66,6 +74,55 @@ un identifiant unique comme briseur d'égalité. `row_number` choisit exactement
 une ligne, contrairement à `rank`. Les bornes `rowsBetween` portent sur des
 lignes ordonnées, `rangeBetween` sur les valeurs de tri : elles ne sont pas
 interchangeables.
+
+## Expressions natives, UDF Python et Pandas UDF
+
+`scripts/udf_and_arrow.py` applique trois fois la même règle (doubler un
+`double`, conserver les valeurs nulles) et compare les résultats, y compris
+zéro et valeurs négatives. La première version utilise une expression native
+Spark, la deuxième une UDF Python scalaire et la troisième une Pandas UDF
+scalaire. Le petit jeu de données sert à vérifier la sémantique, pas à mesurer
+la performance. Les trois plans sont affichés avec `explain("formatted")`.
+
+Une expression native reste dans le moteur Spark/JVM. Catalyst peut analyser
+ses opérateurs et les optimiser ; selon le plan, Spark peut générer du code
+pour les exécuter. Préférer les fonctions natives lorsqu'elles expriment la
+règle : on évite la frontière JVM/Python et on laisse davantage de possibilités
+d'optimisation au moteur.
+
+Une UDF Python ordinaire reçoit une valeur Python à la fois dans un processus
+worker Python. Les données traversent la frontière JVM/Python avec conversion
+et sérialisation ; le corps de la fonction est opaque à Catalyst. L'exemple
+désactive explicitement Arrow pour cette UDF afin d'illustrer le chemin
+classique, généralement visible sous `BatchEvalPython`. Spark 3.5 peut aussi
+utiliser Arrow pour la sérialisation de certaines UDF Python scalaires ; cela
+ne transforme pas leur fonction en opération vectorisée pandas. Une UDF doit
+gérer `None` explicitement et ne doit pas dépendre d'effets de bord : une tâche
+peut être rejouée ou une expression évaluée plusieurs fois.
+
+Une Pandas UDF scalaire transfère des lots de colonnes via Apache Arrow vers un
+worker Python et reçoit des `pandas.Series` ; l'expression pandas opère ici
+sur la série entière. Le retour doit contenir autant de lignes que l'entrée du
+lot et respecter le type Spark déclaré. `ArrowEvalPython` apparaît généralement
+dans son plan physique. `spark.sql.execution.arrow.maxRecordsPerBatch` borne
+le nombre de lignes par lot Arrow (l'exemple le fixe à 2) : il ne fixe ni le
+nombre de partitions ni une limite exacte de mémoire. Les lots réduisent souvent
+le coût par ligne, mais conversion, mémoire JVM et Python, taille des lots et
+calcul restant en Python peuvent encore dominer. Un traitement pandas qui boucle
+ligne par ligne peut perdre l'intérêt de la vectorisation.
+
+Déclarer un type de retour compatible avec les valeurs produites (`DoubleType`
+ici) et tester les conversions : tous les types et structures ne se comportent
+pas de façon identique selon les versions de Spark, pandas et PyArrow. Les
+représentations pandas des valeurs manquantes varient selon le dtype ; l'exemple
+vérifie explicitement le retour SQL `NULL`. Ne pas confondre `NULL` et `NaN`
+ni supposer qu'un cast, un fuseau horaire ou une précision décimale conserve
+automatiquement la même sémantique entre moteurs. La configuration
+`spark.sql.execution.arrow.pyspark.enabled` concerne notamment les conversions
+`toPandas`/création depuis pandas ; elle n'est pas nécessaire pour activer les
+Pandas UDF. Comparer les plans et mesurer sur des données représentatives avant
+de choisir : aucune UDF n'est systématiquement plus rapide qu'une expression
+native. Les noms exacts des opérateurs et les optimisations peuvent varier.
 
 ## Qualité et exercices
 

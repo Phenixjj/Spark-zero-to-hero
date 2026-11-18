@@ -37,6 +37,38 @@ partagent la JVM locale, même si les mêmes concepts de tâches s'appliquent.
 Des workers Python interviennent notamment pour les UDF Python ; les fonctions
 SQL natives utilisées ici s'exécutent côté moteur Spark.
 
+```text
+Programme Python (driver) -> SparkSession / plan SQL (JVM du driver)
+                                      |
+                           planification des tâches
+                                      v
+                     exécuteurs JVM (localement ou sur un cluster)
+                          |                 |
+                    partitions        workers Python si nécessaire
+                          |
+                  lecture / shuffle / écriture
+```
+
+Le gestionnaire de cluster attribue les ressources en mode distribué ; le
+driver coordonne les exécuteurs. Le mode local regroupe les composants dans
+un seul environnement et ne reproduit pas les coûts réseau d'un cluster.
+
+### RDD, DataFrame et Dataset
+
+* Un **RDD** est une collection distribuée de partitions, manipulée par des
+  opérations de bas niveau comme `map` et `reduceByKey`. En PySpark, les
+  fonctions Python passent par des workers et une frontière de sérialisation ;
+  Spark SQL ne peut pas optimiser leur logique arbitraire comme une expression
+  SQL. Les RDD restent utiles pour des traitements non structurés ou un contrôle
+  fin des partitions.
+* Un **DataFrame** possède des colonnes et un schéma ; les expressions SQL
+  natives sont analysées et optimisées par Catalyst. C'est l'API conseillée
+  pour la plupart des données structurées en PySpark.
+* En **Scala et Java**, un `Dataset[T]` offre une API typée, avec des encodeurs
+  entre objets JVM et représentation interne. Un DataFrame est un
+  `Dataset[Row]` non typé au niveau de chaque champ. PySpark expose les
+  DataFrames, pas l'API de Dataset typé `Dataset[T]` de Scala/Java.
+
 Un DataFrame est une description distribuée, pas une liste Python. Son schéma
 décrit types et nullabilité ; celui de `commandes` est explicite dans
 `scripts/demo.py`. L'inférence est pratique pour les données locales mais fragile avec
@@ -67,6 +99,54 @@ comparent des dictionnaires, pas l'ordre de `collect()`.
 petits résultats. Sur de grandes données, écrire un résultat distribué ou
 examiner un échantillon borné. Consulter `explain("formatted")` et l'interface
 Spark UI (désactivée dans les exemples) pour relier plans, étapes et tâches.
+
+### Tungsten : mémoire et exécution
+
+Catalyst analyse et optimise les requêtes puis choisit un plan physique ;
+**Tungsten** désigne des techniques d'exécution utilisées par Spark SQL pour
+réduire les coûts CPU et mémoire. Par exemple, `UnsafeRow` représente certaines
+lignes sous une forme binaire compacte, avec des champs fixes et des offsets
+vers les valeurs variables, plutôt que comme une multitude d'objets Java.
+Spark gère des régions mémoire sur le tas JVM (*on-heap*) et peut utiliser de
+la mémoire hors tas (*off-heap*) lorsqu'elle est configurée. Cela peut réduire
+la pression sur le ramasse-miettes, sans supprimer les limites mémoire ni les
+écritures temporaires sur disque (*spill*).
+
+Le **whole-stage code generation** fusionne certains opérateurs physiques
+compatibles et génère du code Java pour traiter les lignes avec moins d'appels
+et d'objets intermédiaires. Dans `explain("formatted")`, les identifiants
+`codegen id` regroupent les opérateurs concernés ; `explain("codegen")` montre
+les sous-arbres et le code généré disponibles. Tous les opérateurs ne sont pas
+fusionnables : les échanges, certaines opérations et les UDF Python peuvent
+interrompre une étape. Avec AQE, le plan initial peut différer du plan final
+après une action ; inspecter également ce dernier dans Spark UI. La forme
+exacte dépend de la requête, de la configuration et de la version de Spark.
+
+### Lire la Spark UI
+
+Pour explorer l'interface, supprimer ou modifier la configuration
+`spark.ui.enabled=false` de la session de la démo, puis ouvrir l'URL affichée
+par Spark (généralement `http://localhost:4040`) pendant que l'application
+fonctionne. Une application courte peut terminer avant l'inspection ; en
+cluster, suivre le lien fourni par le gestionnaire ou le serveur d'historique
+si celui-ci est configuré.
+
+* **Jobs** : repérer le job créé par une action, sa durée et les étapes
+  associées ; plusieurs actions peuvent produire plusieurs jobs.
+* **Stages** : repérer les frontières de shuffle, les données lues et écrites,
+  les erreurs et les étapes lentes. Une étape comprend des tâches exécutables
+  en parallèle ; une partition donne généralement lieu à une tâche dans
+  l'étape correspondante, mais reprises et exécution spéculative peuvent
+  produire plusieurs tentatives.
+* **Tasks** : comparer durées, volumes, temps GC et spill entre tâches d'une
+  même étape. Une tâche beaucoup plus lente ou volumineuse peut signaler un
+  déséquilibre de données ; vérifier les métriques avant de conclure.
+* **SQL / DataFrame** : relier une action à son plan physique et aux métriques
+  des opérateurs, notamment les échanges et le nombre de lignes ; avec AQE,
+  examiner le plan final après exécution.
+* **Storage** : voir les RDD et DataFrames persistés, leurs partitions
+  matérialisées et leur occupation mémoire/disque. `cache()` seul ne remplit
+  pas le cache : une action doit d'abord calculer les partitions.
 
 ## Défi — ventes par client
 
